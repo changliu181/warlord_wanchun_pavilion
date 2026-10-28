@@ -19,13 +19,14 @@ import pygame
 from ai import ai_pump
 from config import ConfigError, neighbors, parse_map, parse_roster, pick_spawns
 from constants import (
-    AI, AI_STEP_FRAMES, ATK_RETREAT_COST, ATTACK_COST, BOARD, CELL, CELL_CAPACITY,
-    CITY, CITY_DEFENSE_MULT,
+    AI, AI_STEP_FRAMES, AI_VERSION_NOTE, AI_VERSION_ORDER,
+    ATK_RETREAT_COST, ATTACK_COST, BOARD, CELL, CELL_CAPACITY,
+    CITY, CITY_DEFENSE_MULT, DEFAULT_AI_VERSION,
     DEPLOY_COUNT, FACTION_SHORT, FPS, GRAIN_EAT_MAX, GRAIN_EVERY_TURNS, GRAIN_HEAL,
     GRAIN_PER_CITY, GRAIN_PER_STONE, GRAIN_TURN_FIRST, GRID, GeneralSpec, HUMAN,
     LOSS_MAX_PER_MIGHT, MAP_FILE, MARGIN,
     MAX_STAMINA, MOVE_POINTS, OBSTACLE, P1, P2, PLAYER_COLOR, PLAYER_COLOR_DARK,
-    PLAYER_NAME, REGEN, RETREAT_MAX, ROSTER_FILE, SCORE_GENERAL_BASE, SCORE_GRAIN,
+    PLAYER_NAME, REGEN, REPLAY, RETREAT_MAX, ROSTER_FILE, SCORE_GENERAL_BASE, SCORE_GRAIN,
     SCORE_TERRAIN, SIDEBAR, STRATAGEM_MOVE_COST, STRATAGEM_RANGE, STRATAGEM_STAMINA_COST,
     TERRAIN_NAME, TURN_LIMIT, WIN_H, WIN_W,
     C_ATTACK, C_BG, C_BTN, C_BTN_HOVER, C_CITY, C_CITY_ALT, C_CUNNING, C_CUNNING_BG,
@@ -34,6 +35,7 @@ from constants import (
     C_PLAIN, C_PLAIN_ALT, C_SELECT, C_TEXT, C_TEXT_DIM, C_WARN,
 )
 import stratagems
+from replay import Recorder
 
 
 def round_half_up(value):
@@ -514,6 +516,9 @@ class CunningAim:
         game.push_log(f"🎴 {gen.name} 对 {game.describe(*cell)} 用「{name}」："
                       f"成功率 {rate * 100:.0f}%，掷出 {roll * 100:.0f}"
                       + ("—— 得手！" if got else "—— 失手。"))
+        if game.recorder is not None:
+            game.recorder.act("strat", by=gen.name, owner=gen.owner, key=key, name=name,
+                              cell=[cell[0], cell[1]], rate=rate, roll=roll, got=got)
         if not got:
             self._done(f"{name}失手")
             return
@@ -566,6 +571,8 @@ class CunningAim:
         game, gen = self.game, self.gen
         game.aim = None
         game.check_victory()                             # 内讧可能打死人
+        if game.recorder is not None:
+            game.recorder.act("strat_effect", detail=banner)   # 计谋的落点（成没成都记）
         if gen.alive:
             game.select(gen)                             # 行动力变了，可走范围跟着变
         else:
@@ -614,11 +621,61 @@ class Game:
     SIDEBAR_X = MARGIN * 2 + BOARD   # 侧边栏左边界
 
     def __init__(self, seed=None):
+        self.seed = seed                  # 记住种子：录像头部要写它（按 R 重开也沿用同一个）
         self.rng = random.Random(seed)
         self.players = 2                  # 1 = 人机对战，2 = 同机对战
         self.human_side = P1              # 一人游玩时人类执哪一边
         self.controllers = {P1: HUMAN, P2: HUMAN}
+        # 每一方的电脑用哪个版本（`梅` / `兰` / `竹` / `菊`，见 constants.AI_VERSIONS）。
+        # 两边可以不一样——菊对梅就是靠这一条；人类那一边填了也没人看。
+        self.ai_versions = {P1: DEFAULT_AI_VERSION, P2: DEFAULT_AI_VERSION}
+        self.recorder = None              # 录像（replay.Recorder）；没开录时是 None
         self.new_game()
+
+    @classmethod
+    def for_replay(cls):
+        """建一个**不读配置**的空壳 Game，只用来画复盘（replay.py 的图形复盘）。
+
+        正常开局的 Game 会去读 map.txt / generals.txt，可复盘不同：棋盘、地名、武将
+        全部来自**录像头部**，跟当前的配置文件毫无关系。所以这里绕开 `__init__`，只把
+        "绘制路径要用到"的那些属性按下面的约定摆好；调用方（`replay._Gui`）随后把
+        `grid` / `places` 换成录像里的、并把每帧的 `generals` / `grain` / `turn` 等灌进来。
+
+        绘制契约（改了下面这些的读法，就得同步改 replay.py 的 `_Gui._sync`）：
+        `grid`、`places` 是地图；每帧要设 `generals`（General 列表）、`grain`、
+        `turn`、`current`、`over`、`winner`；`draw_board` 还会读 `selected` / `aim` /
+        `reachable` / `attackable`，`draw_score_board` 会读 `generals` + `grain`。
+        """
+        game = cls.__new__(cls)
+        game.grid = []                    # 调用方（replay._Gui）随后换成录像头部的地图
+        game.places = {}
+        game.roster = {P1: [], P2: []}
+        game.spawns = {}
+        game.generals = []
+        game.current = P1
+        game.turn = 1
+        game.selected = None
+        game.reachable = {}
+        game.attackable = set()
+        game.grain = {}
+        game.grain_pick = None
+        game.cunning = None
+        game.aim = None
+        game.over = False
+        game.winner = None
+        game.banner = None
+        game.battle = None
+        game.log = []
+        game.roster_scroll = 0
+        game.ai_timer = AI_STEP_FRAMES
+        game.players = 2
+        game.human_side = P1
+        game.seed = None
+        game.rng = random.Random()
+        game.controllers = {P1: HUMAN, P2: HUMAN}
+        game.ai_versions = {P1: DEFAULT_AI_VERSION, P2: DEFAULT_AI_VERSION}
+        game.recorder = None
+        return game
 
     # ---------------- 开局 ----------------
     def new_game(self):
@@ -648,18 +705,54 @@ class Game:
         self.create_generals()
         self.start_turn(announce=False)
 
-    def start_match(self, human_side=P1, players=2):
-        """按选定的模式开一局；配置有问题就抛 ConfigError，当前对局原样保留。"""
+    def start_match(self, human_side=P1, players=2, ai_version=DEFAULT_AI_VERSION):
+        """按选定的模式开一局；配置有问题就抛 ConfigError，当前对局原样保留。
+
+        `ai_version` 只给 1P 用——单机时两边（人类那一边也填上，免得从 2P 切回来还留着旧值）
+        都记成这个版本，`ai_versions` 就是"某一方在用哪版电脑"的唯一出处。
+        """
         self.new_game()                   # 先把新的地图/武将读好，失败就不会动到控制器
         self.players = players
         self.human_side = human_side
         if players == 1:
             self.controllers = {human_side: HUMAN, 1 - human_side: AI}
+            self.ai_versions = {P1: ai_version, P2: ai_version}
             side = FACTION_SHORT[human_side]
-            self.push_log(f"人机对战：你执{side}，电脑执另一边。")
+            self.push_log(f"人机对战：你执{side}，电脑执另一边（{ai_version}版）。")
         else:
             self.controllers = {P1: HUMAN, P2: HUMAN}
+            self.ai_versions = {P1: DEFAULT_AI_VERSION, P2: DEFAULT_AI_VERSION}
         self.ai_timer = AI_STEP_FRAMES
+        self.start_recording()            # 有电脑参与就自动记一份录像（见 REPLAY）
+
+    def start_recording(self, path=None):
+        """开一份录像（有电脑参与才开）；已经有一份就静默跳过，免得连开两局时重复写。
+
+        录像总是在**第 1 回合刚开局**时开（`start_match` 里，或迟一点到第一次 `ai_pump`），
+        所以这里顺手补一条当前回合的快照——否则第 1 回合的动作会没有抬头。
+        """
+        if REPLAY and self.recorder is None and AI in self.controllers.values():
+            self.recorder = Recorder(self, path)
+            self.record_turn()
+
+    def record_turn(self):
+        """开局时记一条回合快照（棋盘与交战屏共用）。录像没开就是空操作。"""
+        if self.recorder is not None:
+            self.recorder.turn(self)
+
+
+    def set_ai_versions(self, p1_version=None, p2_version=None):
+        """指定某几方的电脑版本（没传的那一边不动）。对战脚本用它摆"菊对梅"这种局面。"""
+        for player, version in ((P1, p1_version), (P2, p2_version)):
+            if version is not None:
+                self.ai_versions[player] = version
+
+    def ai_version(self, player=None):
+        """这一方的电脑是哪个版本（不传就是当前行动方）。
+
+        交战屏上要用**做决定那一方**的版本，所以一律显式传 owner，别让它默认跟着 current 走。
+        """
+        return self.ai_versions[player if player is not None else self.current]
 
     def is_ai(self, player=None):
         """这一方是不是电脑在操控（不传就是当前行动方）。"""
@@ -845,6 +938,8 @@ class Game:
             self.push_log(f"⚑ 各城池入库 {made} 石粮草"
                           f"（每 {GRAIN_EVERY_TURNS} 回合一次），"
                           f"散落在野的共 {self.grain_stock()} 石。")
+            if self.recorder is not None:
+                self.recorder.grain(self, made)
         return made
 
     def eat_amounts(self, gen):
@@ -869,6 +964,9 @@ class Game:
         self.push_log(f"🍚 {gen.name} 吃粮 {amount} {GRAIN_PER_STONE}，"
                       f"体力 +{gained}（{before}→{gen.stamina}），"
                       f"剩移动力 {gen.move_points}。")
+        if self.recorder is not None:
+            self.recorder.act("eat", by=gen.name, owner=gen.owner, amount=amount,
+                              hp=[before, gen.stamina], mp=gen.move_points)
         self.select(gen)                  # 移动力变了，可走范围跟着变
         return True
 
@@ -933,6 +1031,7 @@ class Game:
     def walk(self, gen, row, col, steps, carry=0):
         """真正落地：从出发点取粮，走到目的地后**当场卸下**、并入那一格的粮堆。"""
         # 武将只是脚夫、不是粮仓：粮草从不带在身上，所以这一趟的净效果就是挪一格
+        orig = gen.pos                        # 出发点：录像里记下从哪走到哪
         picked = self.take_grain(gen.row, gen.col, carry) if carry > 0 else 0
         gen.row, gen.col = row, col
         gen.move_points = max(0, gen.move_points - steps)
@@ -942,6 +1041,10 @@ class Game:
                       f"{self.describe(row, col)}" if picked else "")
         self.push_log(f"{gen.name} 移动 {steps} 格至 {self.describe(row, col)}，"
                       f"剩余移动力 {gen.move_points}{with_grain}。")
+        if self.recorder is not None:
+            self.recorder.act("move", by=gen.name, owner=gen.owner,
+                              frm=[orig[0], orig[1]], to=[row, col], steps=steps,
+                              mp=gen.move_points, carry=picked)
         self.select(gen)                      # 重新计算剩余可走范围
         # 移动后与敌人相邻，提示一句可以打
         if self.compute_attackable(gen):
@@ -958,6 +1061,10 @@ class Game:
         defenders = self.generals_at(row, col)
         attacker.move_points = max(0, attacker.move_points - ATTACK_COST)
         self.clear_selection()                    # 交战期间棋盘不响应操作
+        if self.recorder is not None:             # 先记"进攻"，再建 Battle（它记"交战于"）
+            self.recorder.act("charge", by=attacker.name, owner=attacker.owner,
+                              cell=[row, col], defenders=[g.name for g in defenders],
+                              mp=attacker.move_points)
         self.battle = Battle(self, attacker, defenders)
         self.push_log(f"⚔ {attacker.name} 进攻 {self.describe(row, col)}"
                       f"（守军：{'、'.join(g.name for g in defenders)}）。")
@@ -1006,6 +1113,7 @@ class Game:
                 gen.reset_turn()
         if announce:                          # 开局第一次不重复播报（前面已说"玩家一先行"）
             self.push_log(f"--- 第 {self.turn} 回合，轮到 {PLAYER_NAME[self.current]} ---")
+        self.record_turn()                    # 录像：这一回合开始时的全盘快照
 
     def check_victory(self):
         alive1 = [g for g in self.generals if g.alive and g.owner == P1]
@@ -1113,6 +1221,8 @@ class Game:
         self.winner = player
         self.push_log(text)
         self.banner = [text, None]            # 帧数 None = 常驻，胜负提示一直挂着
+        if self.recorder is not None:         # 终局：写完这一条，整份录像就完整了
+            self.recorder.end(self)
 
     # ---------------- 提示信息 ----------------
     def push_log(self, msg):
@@ -1391,12 +1501,15 @@ class Game:
             dot = pygame.Rect(panel.left + 16, y + 4, 14, 14)
             pygame.draw.rect(screen, PLAYER_COLOR[self.current], dot, border_radius=4)
             if self.is_ai():
-                # 电脑行动时不用报"几人走完"，它自己会一直走到走完
-                text = f"{PLAYER_NAME[self.current]} · 电脑思考中…"
+                # 电脑行动时不用报"几人走完"，它自己会一直走到走完；但在用哪一版得报出来
+                text = f"{PLAYER_NAME[self.current]} · {self.ai_version()}版思考中…"
             else:
+                side = PLAYER_NAME[self.current]
+                if self.is_ai(1 - self.current):
+                    side += f"（对 {self.ai_version(1 - self.current)}版电脑）"
                 gens = [g for g in self.generals if g.alive and g.owner == self.current]
                 done = sum(1 for g in gens if g.exhausted)
-                text = f"{PLAYER_NAME[self.current]}  ({done}/{len(gens)} 已走完)"
+                text = f"{side}  ({done}/{len(gens)} 已走完)"
             screen.blit(get_font(14, bold=True).render(text, True, C_TEXT), (panel.left + 38, y))
             y += 30
         else:
@@ -1615,6 +1728,7 @@ class Battle:
     def __init__(self, game, attacker, defenders):
         self.game = game
         self.rng = game.rng
+        self.recorder = game.recorder         # 录像；整场交战的子事件都记进去
         self.atk = attacker
         self.defenders = list(defenders)      # 这一格的守军，出场顺序由守方定
         self.cell = self.defenders[0].pos     # 争夺中的格子（守方原本站的地方）
@@ -1644,6 +1758,12 @@ class Battle:
             self.hint = f"两军在 {self.place} 列阵，准备交手。"
         if self.city_defense:
             self.hint += f"（{self.place}，守军据城力战，体力 +20%）"
+        if self.recorder is not None:
+            self.recorder.battle("begin", cell=[self.cell[0], self.cell[1]],
+                                 place=self.place, atk=self.atk.name,
+                                 atk_owner=self.atk.owner,
+                                 dfd=[g.name for g in self.defenders],
+                                 city=self.city_defense)
 
     def begin_fight(self, defender):
         """让 defender 上场迎战：第一场从 READY 起手，第二场从"开打前可撤退"起手。"""
@@ -1719,6 +1839,10 @@ class Battle:
                             "atk_hp": self.atk.stamina, "dfd_hp": self.dfd.stamina})
         self.hint = (f"第 {self.round} 回合：{self.atk.name} 掉 {atk_loss} 点体力，"
                      f"{self.dfd.name} 掉 {dfd_loss} 点体力。")
+        if self.recorder is not None:
+            self.recorder.battle("roll", round=self.round, atk=self.atk.name,
+                                 dfd=self.dfd.name, atk_loss=atk_loss, dfd_loss=dfd_loss,
+                                 atk_hp=self.atk.stamina, dfd_hp=self.dfd.stamina)
         self.state, self.timer = self.IMPACT, self.IMPACT_FRAMES
 
     def update(self):
@@ -1738,6 +1862,10 @@ class Battle:
 
     def continue_fight(self):
         """选择继续：攻方选完轮到守方，两边都选继续就打下一回合。"""
+        if self.recorder is not None:
+            who = self.atk if self.state == self.CHOOSE_ATK else self.dfd
+            side = "atk" if self.state == self.CHOOSE_ATK else "dfd"
+            self.recorder.battle("hold", name=who.name, who=side, owner=who.owner)
         if self.state == self.CHOOSE_ATK:
             self.state = self.CHOOSE_DFD
             self.hint = (f"{self.atk.name} 继续缠斗，现在轮到 {self.dfd.name}（守方）"
@@ -1760,6 +1888,10 @@ class Battle:
             text = f"{dfd.name} 力竭阵亡，{atk.name} 获胜。"
         game.push_log(f"⚔ {atk.name} vs {dfd.name} 共 {self.round} 回合：{text}")
         self.ending = text
+        if self.recorder is not None:
+            deaths = [g.name for g in (atk, dfd) if not g.alive]
+            self.recorder.battle("duel_end", atk=atk.name, dfd=dfd.name,
+                                 rounds=self.round, text=text, deaths=deaths)
         self.advance(text)
 
     def advance(self, text):
@@ -1783,6 +1915,11 @@ class Battle:
         for defender in self.defenders:
             defender.drop_city_boost()        # 守城加成到此为止，体力压回原比例
         self.apply()                          # 定下谁最终站在这一格上
+        if self.recorder is not None:
+            self.recorder.battle("end", text=text, place=self.place,
+                                 atk=self.atk.name,
+                                 atk_pos=[self.atk.row, self.atk.col],
+                                 atk_retreated=self.atk_retreated)
 
     def apply(self):
         """战果落回地图：守军清空且攻方没退没死，攻方才进占这一格。"""
@@ -1847,6 +1984,10 @@ class Battle:
 
     def request_retreat(self, gen):
         """点了"撤退"：攻方就地收手（补一笔移动力），守方先挑撤到哪一格。"""
+        if self.recorder is not None:
+            who = "atk" if gen is self.atk else "dfd"
+            self.recorder.battle("retreat", name=gen.name, who=who, owner=gen.owner,
+                                 mp=gen.move_points)
         if gen is self.atk:
             if gen.move_points < ATK_RETREAT_COST:
                 return                        # 付不起时本来就不给按钮，这里只是兜底
@@ -1885,6 +2026,10 @@ class Battle:
             f"（判为败方，本回合累计撤退 {gen.move_debt} 格，"
             f"下回合透支 {gen.move_debt} 点行动力）。")
         self.ending = f"{gen.name} 撤到 {to}，判为败方；{self.atk.name} 占上风。"
+        if self.recorder is not None:
+            self.recorder.battle("retreat_done", name=gen.name, who="dfd",
+                                 dest=[dest[0], dest[1]], steps=steps,
+                                 debt=gen.move_debt)
         self.advance(self.ending)
 
     # ---------------- 操作 ----------------
@@ -1959,9 +2104,18 @@ class Battle:
         first = self.defenders[index]
         self.defenders = [first] + [g for g in self.defenders if g is not first]
         self.game.push_log(f"{first.name} 出阵迎战 {self.atk.name}。")
+        if self.recorder is not None:
+            self.recorder.battle("pick", first=first.name, atk=self.atk.name)
         self.begin_fight(first)
 
     def handle_click(self, pos):
+        # 点将那一屏：直接点守将的**卡片**也算选中（卡片又大又显眼，是人的自然动作），
+        # 不必非得去够底部那排小按钮。
+        if self.state == self.PICK_DEFENDER:
+            for i, gen in enumerate(self.defenders):
+                if self.card_rect(gen).collidepoint(pos):
+                    self.act(f"pick:{i}")
+                    return
         for _label, rect, action in self.buttons():
             if rect.collidepoint(pos):
                 self.act(action)
@@ -2205,7 +2359,7 @@ class Battle:
                          "本回合累计不能超过 MOVE_POINTS"
                          " · 这里按空格 / 回车不生效，免得误撤")
         elif self.state == self.PICK_DEFENDER:
-            foot_text = ("点下方按钮决定谁先出阵 · 排在后面的那位会在前一位下场后接着打"
+            foot_text = ("点守将卡片（或下方按钮）决定谁先出阵 · 排在后面的那位会在前一位下场后接着打"
                          " · 这里按空格 / 回车不生效，免得替你定顺序")
         else:
             foot_text = ("空格 / 回车 = 第一个按钮（交手、继续缠斗、返回战场）  ·  撤退请点按钮"
@@ -2268,10 +2422,10 @@ def show_config_error(exc):
 
 
 def choose_mode(screen, clock):
-    """开局的模式选择 -> (人类执哪边, 玩家人数)；关窗口 / ESC 退出返回 None。
+    """开局的模式选择 -> (人类执哪边, 玩家人数, 电脑版本)；关窗口 / ESC 退出返回 None。
 
-    两步走：先选一人游玩还是两人同机，选了一人再选执蜀还是执魏；
-    第二步按 ESC 是回上一步，不是退出。
+    三步走：先选一人游玩还是两人同机；选了一人再选执蜀还是执魏，最后选电脑用哪个版本。
+    中间两步按 ESC 是回上一步，不是退出（版本那一步退回"执哪边"）。
     """
     idx = menu_screen(screen, clock, "选择对局模式",
                       [("一人游玩（对抗电脑）", "你执一边，另一边交给电脑"),
@@ -2280,27 +2434,55 @@ def choose_mode(screen, clock):
     if idx is None:
         return None
     if idx == 1:
-        return P1, 2                          # 两人同机：不关心执哪边
+        return P1, 2, DEFAULT_AI_VERSION      # 两人同机：没有电脑，版本用默认值占位
+    return choose_side(screen, clock)
+
+
+def choose_side(screen, clock):
+    """选执哪一边 -> 继续走下一步；按 ESC 回第一步（只有第一步的 ESC 才是退出）。"""
     idx = menu_screen(screen, clock, "你执哪一边？",
                       [(f"执 {FACTION_SHORT[P1]}（红，先手）", "玩家一，开局先走"),
                        (f"执 {FACTION_SHORT[P2]}（蓝，后手）", "玩家二，电脑先走一步")],
                       "点一下选项，或按 1 / 2　·　ESC 返回上一步")
     if idx is None:
-        return choose_mode(screen, clock)     # 退回上一步
-    return (P1 if idx == 0 else P2), 1
+        return choose_mode(screen, clock)      # 退回第一步
+    return choose_ai_version(screen, clock, P1 if idx == 0 else P2)
+
+
+def choose_ai_version(screen, clock, human_side):
+    """选电脑用哪个版本 -> (人类执哪边, 1, 版本名)；按 ESC 回上一步。
+
+    版本只是电脑的棋力档位（`AI_VERSION_ORDER`：梅 / 兰 / 竹 / 菊，第一项是默认的参照版），
+    选哪个都不影响规则，只影响对面怎么想。
+    """
+    other = FACTION_SHORT[1 - human_side]
+    options = [(f"{name}版——{AI_VERSION_NOTE[name]}", f"电脑执 {other}")
+               for name in AI_VERSION_ORDER]
+    idx = menu_screen(screen, clock, "电脑用哪个版本？", options,
+                      f"点一下选项，或按 1–{len(options)}　·　ESC 返回上一步")
+    if idx is None:
+        return choose_side(screen, clock)      # 退回上一步
+    return human_side, 1, AI_VERSION_ORDER[idx]
 
 
 def menu_screen(screen, clock, title, options, foot):
-    """画一屏选项 -> 选中的下标；关窗口 / 按 ESC 返回 None（选项是 (标题, 说明) 两项）。"""
+    """画一屏选项 -> 选中的下标；关窗口 / 按 ESC 返回 None（选项是 (标题, 说明) 两项）。
+
+    按钮高度随选项个数自适应：选项多时压缩高度、收紧间距，保证整屏（含标题和底部
+    提示）都落在窗口里——版本从 2 个加到 4 个就是这么撑住的。
+    """
     f_title = get_font(30, bold=True)
-    f_sub = get_font(14)
     f_btn = get_font(19, bold=True)
     f_note = get_font(13)
     f_foot = get_font(13)
-    width, height, gap = 520, 72, 18
-    top = WIN_H // 2 - (len(options) * (height + gap)) // 2 + 20
+    n = len(options)
+    width = 520
+    gap = 18 if n <= 3 else 12
+    height = min(72, (WIN_H - 210 - (n - 1) * gap) // n)   # 210 ≈ 上留白 + 标题 + 底部提示
+    block = n * height + (n - 1) * gap
+    top = max(96, WIN_H // 2 - block // 2)                 # 太靠上就贴住，别越过标题
     rects = [pygame.Rect((WIN_W - width) // 2, top + i * (height + gap), width, height)
-             for i in range(len(options))]
+             for i in range(n)]
 
     while True:
         mouse = pygame.mouse.get_pos()
@@ -2312,7 +2494,7 @@ def menu_screen(screen, clock, title, options, foot):
                     return None
                 if pygame.K_1 <= event.key <= pygame.K_9:
                     idx = event.key - pygame.K_1
-                    if idx < len(options):
+                    if idx < n:
                         return idx
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 for i, rect in enumerate(rects):
@@ -2321,22 +2503,132 @@ def menu_screen(screen, clock, title, options, foot):
 
         screen.fill(C_BG)
         head = f_title.render(title, True, C_TEXT)
-        screen.blit(head, head.get_rect(midtop=(WIN_W // 2, WIN_H // 2 - 170)))
+        screen.blit(head, head.get_rect(midtop=(WIN_W // 2, top - 76)))
         for i, (label, note) in enumerate(options):
             rect = rects[i]
             hover = rect.collidepoint(mouse)
             pygame.draw.rect(screen, C_BTN_HOVER if hover else C_PANEL, rect, border_radius=10)
             pygame.draw.rect(screen, C_GOLD if hover else C_BTN, rect, 2, border_radius=10)
             txt = f_btn.render(label, True, C_TEXT)
-            screen.blit(txt, txt.get_rect(midleft=(rect.left + 52, rect.top + 26)))
+            screen.blit(txt, txt.get_rect(midleft=(rect.left + 52, rect.centery - 10)))
             sub = f_note.render(note, True, C_TEXT_DIM)
-            screen.blit(sub, sub.get_rect(midleft=(rect.left + 52, rect.top + 50)))
+            screen.blit(sub, sub.get_rect(midleft=(rect.left + 52, rect.centery + 14)))
             num = get_font(16, bold=True).render(str(i + 1), True, C_GOLD)
             screen.blit(num, num.get_rect(center=(rect.left + 28, rect.center[1])))
         tip = f_foot.render(foot, True, C_TEXT_DIM)
         screen.blit(tip, tip.get_rect(midbottom=(WIN_W // 2, WIN_H - 44)))
         pygame.display.flip()
         clock.tick(FPS)
+
+
+def handle_game_event(game, event, buttons):
+    """处理一个 pygame 事件（棋盘 / 交战屏 / 各种弹窗都归这里）。-> None / "menu" / "quit"。
+
+    主程序 `play_match` 和进攻策略测试台（`offense_bench.py`）**共用这一套**：键盘鼠标的归属规则只写
+    一份，测试台里守方的点选、弹窗、结束回合就跟正式对局一模一样。返回 `"menu"` 表示该退回选择屏
+    （主程序按 R）、`"quit"` 表示退出程序（ESC / 关窗口）；其余返回 None，调用方继续跑。
+    """
+    if event.type == pygame.QUIT:
+        return "quit"
+    if game.battle is not None:
+        # 交战界面键盘鼠标都归它管；ESC / R 故意不生效，免得误触把这一局丢了
+        battle = game.battle
+        key = event.key if event.type == pygame.KEYDOWN else None
+        if key == pygame.K_UP:                 # 翻看战报随时都行，不算做决定
+            battle.scroll_history(1)
+        elif key == pygame.K_DOWN:
+            battle.scroll_history(-1)
+        elif key == pygame.K_PAGEUP:
+            battle.scroll_history(battle.HIST_ROWS)
+        elif key == pygame.K_PAGEDOWN:
+            battle.scroll_history(-battle.HIST_ROWS)
+        elif event.type == pygame.MOUSEWHEEL:
+            battle.scroll_history(event.y)
+        elif game.human_may_act():
+            # 轮到人类这一方做决定时键盘鼠标才接；电脑在想的时候点了不算
+            if key in (pygame.K_SPACE, pygame.K_RETURN):
+                battle.primary()
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                battle.handle_click(event.pos)
+        return None
+    if game.grain_pick is not None:
+        # 「带多少粮草」弹窗：这一步的键盘鼠标都归它管；放在前面是为了盖住
+        # 下面的空格结束回合 / 点棋盘，不然会带着弹窗走子
+        pick = game.grain_pick
+        if event.type == pygame.KEYDOWN:
+            step = {pygame.K_LEFT: -1, pygame.K_RIGHT: 1,
+                    pygame.K_DOWN: -10, pygame.K_UP: 10}.get(event.key)
+            if step is not None:
+                pick.adjust(step)
+            elif event.key in (pygame.K_SPACE, pygame.K_RETURN):
+                pick.primary()
+            elif event.key == pygame.K_ESCAPE:
+                pick.act("cancel")        # 这一步当作没走，武将继续选着
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            pick.handle_click(event.pos)
+        return None
+    if game.cunning is not None:
+        # 用计弹窗：键盘鼠标都归它管，挑定计谋（或取消）才回到棋盘。
+        if event.type == pygame.KEYDOWN:
+            game.cunning.handle_key(event.key)
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            game.cunning.handle_click(event.pos)
+        return None
+    if game.aim is not None:
+        # 用计瞄准态：点目标才结算
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            game.aim.cancel()
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            mx, my = event.pos
+            board_x, board_y = mx - MARGIN, my - MARGIN
+            if 0 <= board_x < BOARD and 0 <= board_y < BOARD:
+                game.aim.handle_click(board_y // CELL, board_x // CELL)
+        return None
+    if event.type == pygame.MOUSEWHEEL:
+        # 滚轮翻武将总览：鼠标得在总览那块上，免得跟别处的手感打架
+        if game.roster_rect(buttons).collidepoint(pygame.mouse.get_pos()):
+            game.scroll_roster(-event.y)      # 滚轮向下（y 为负）= 往后翻
+        return None
+    if event.type == pygame.KEYDOWN:
+        if event.key == pygame.K_ESCAPE:
+            return "quit"
+        if event.key in (pygame.K_SPACE, pygame.K_RETURN):
+            if game.human_may_act():
+                game.end_turn()
+        elif event.key == pygame.K_r:
+            return "menu"
+        return None
+    if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+        mx, my = event.pos
+        hit_button = None
+        for _label, rect, key in buttons:
+            if rect.collidepoint(mx, my):
+                hit_button = key
+                break
+        if hit_button == "end":
+            if game.human_may_act():
+                game.end_turn()
+        elif hit_button == "restart":
+            return "menu"
+        elif hit_button == "quit":
+            return "quit"
+        elif game.human_may_act():
+            # 「用计」和「吃粮」按钮都长在详情框里，先试它们，再交给棋盘
+            cunning = game.cunning_button()
+            if cunning is not None and cunning.collidepoint(mx, my):
+                game.open_cunning()
+                return None
+            eat = next((n for _l, rect, n in game.eat_buttons()
+                        if rect.collidepoint(mx, my)), None)
+            if eat is not None:
+                game.eat_grain(game.selected, eat)
+                return None
+            # 按钮都在右侧面板里（x 远大于棋盘右边界），所以落不到按钮上的点击
+            # 只要在棋盘矩形内就交给棋盘；别再按 y 去卡，否则最下面几行点不到。
+            board_x, board_y = mx - MARGIN, my - MARGIN
+            if 0 <= board_x < BOARD and 0 <= board_y < BOARD:
+                game.handle_board_click(board_y // CELL, board_x // CELL)
+    return None
 
 
 def play_match(screen, clock, game, buttons):
@@ -2346,102 +2638,12 @@ def play_match(screen, clock, game, buttons):
     while running:
         mouse_pos = pygame.mouse.get_pos()
         for event in pygame.event.get():
-            if event.type == pygame.QUIT:
+            verdict = handle_game_event(game, event, buttons)   # 输入处理与测试台共用
+            if verdict == "quit":
                 running = False
-            elif game.battle is not None:
-                        # 交战界面键盘鼠标都归它管；ESC / R 故意不生效，免得误触把这一局丢了
-                battle = game.battle
-                key = event.key if event.type == pygame.KEYDOWN else None
-                if key == pygame.K_UP:                 # 翻看战报随时都行，不算做决定
-                    battle.scroll_history(1)
-                elif key == pygame.K_DOWN:
-                    battle.scroll_history(-1)
-                elif key == pygame.K_PAGEUP:
-                    battle.scroll_history(battle.HIST_ROWS)
-                elif key == pygame.K_PAGEDOWN:
-                    battle.scroll_history(-battle.HIST_ROWS)
-                elif event.type == pygame.MOUSEWHEEL:
-                    battle.scroll_history(event.y)
-                elif game.human_may_act():
-                    # 轮到人类这一方做决定时键盘鼠标才接；电脑在想的时候点了不算
-                    if key in (pygame.K_SPACE, pygame.K_RETURN):
-                        battle.primary()
-                    elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                        battle.handle_click(event.pos)
-            elif game.grain_pick is not None:
-                # 「带多少粮草」弹窗：这一步的键盘鼠标都归它管；放在前面是为了盖住
-                # 下面的空格结束回合 / 点棋盘，不然会带着弹窗走子
-                pick = game.grain_pick
-                if event.type == pygame.KEYDOWN:
-                    step = {pygame.K_LEFT: -1, pygame.K_RIGHT: 1,
-                            pygame.K_DOWN: -10, pygame.K_UP: 10}.get(event.key)
-                    if step is not None:
-                        pick.adjust(step)
-                    elif event.key in (pygame.K_SPACE, pygame.K_RETURN):
-                        pick.primary()
-                    elif event.key == pygame.K_ESCAPE:
-                        pick.act("cancel")        # 这一步当作没走，武将继续选着
-                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    pick.handle_click(event.pos)
-            elif game.cunning is not None:
-                # 用计弹窗：键盘鼠标都归它管，挑定计谋（或取消）才回到棋盘。
-                if event.type == pygame.KEYDOWN:
-                    game.cunning.handle_key(event.key)
-                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    game.cunning.handle_click(event.pos)
-            elif game.aim is not None:
-                # 用计瞄准态：点目标才结算
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                    game.aim.cancel()
-                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    mx, my = event.pos
-                    board_x, board_y = mx - MARGIN, my - MARGIN
-                    if 0 <= board_x < BOARD and 0 <= board_y < BOARD:
-                        game.aim.handle_click(board_y // CELL, board_x // CELL)
-            elif event.type == pygame.MOUSEWHEEL:
-                # 滚轮翻武将总览：鼠标得在总览那块上，免得跟别处的手感打架
-                if game.roster_rect(buttons).collidepoint(pygame.mouse.get_pos()):
-                    game.scroll_roster(-event.y)      # 滚轮向下（y 为负）= 往后翻
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    running = False
-                elif event.key in (pygame.K_SPACE, pygame.K_RETURN):
-                    if game.human_may_act():
-                        game.end_turn()
-                elif event.key == pygame.K_r:
-                    back_to_menu = True
-                    running = False
-            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                mx, my = event.pos
-                hit_button = None
-                for _label, rect, key in buttons:
-                    if rect.collidepoint(mx, my):
-                        hit_button = key
-                        break
-                if hit_button == "end":
-                    if game.human_may_act():
-                        game.end_turn()
-                elif hit_button == "restart":
-                    back_to_menu = True
-                    running = False
-                elif hit_button == "quit":
-                    running = False
-                elif game.human_may_act():
-                    # 「用计」和「吃粮」按钮都长在详情框里，先试它们，再交给棋盘
-                    cunning = game.cunning_button()
-                    if cunning is not None and cunning.collidepoint(mx, my):
-                        game.open_cunning()
-                        continue
-                    eat = next((n for _l, rect, n in game.eat_buttons()
-                                if rect.collidepoint(mx, my)), None)
-                    if eat is not None:
-                        game.eat_grain(game.selected, eat)
-                        continue
-                    # 按钮都在右侧面板里（x 远大于棋盘右边界），所以落不到按钮上的点击
-                    # 只要在棋盘矩形内就交给棋盘；别再按 y 去卡，否则最下面几行点不到。
-                    board_x, board_y = mx - MARGIN, my - MARGIN
-                    if 0 <= board_x < BOARD and 0 <= board_y < BOARD:
-                        game.handle_board_click(board_y // CELL, board_x // CELL)
+            elif verdict == "menu":
+                back_to_menu = True
+                running = False
 
         battle = game.battle
         if battle is not None:
@@ -2480,9 +2682,9 @@ def main():
         choice = choose_mode(screen, clock)
         if choice is None:
             break
-        human_side, players = choice
+        human_side, players, ai_version = choice
         try:
-            game.start_match(human_side, players)
+            game.start_match(human_side, players, ai_version)
         except ConfigError as exc:
             # 选完模式才发现配置被改坏了：提示一下，回到选择屏
             game.push_log(f"开不了新局：{exc}")
